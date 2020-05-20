@@ -27,9 +27,13 @@ from sklearn.linear_model import HuberRegressor
 from sklearn.linear_model import LinearRegression, ElasticNet
 from sklearn.metrics import mean_squared_error
 from sklearn.decomposition import PCA 
-from functools import partial 
-from pathos.multiprocessing import ProcessingPool as Pool
 from sklearn.cross_decomposition import PLSRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from functools import partial 
+#from pathos.multiprocessing import ProcessingPool as Pool
+#from pathos.pools import ProcessPool as Pool 
+from pathos.pools import ThreadPool as Pool 
 
 
 #Ref 
@@ -56,6 +60,7 @@ class expanding_window(object):
     ---------
     1. Huber Loss param not tuned 
     2. Rolling procedure: Parallel ? -- now only the tuning within each roling is parallelized
+    3. # Nested parallel: Not enough space if the data is too big.
     '''
     
 
@@ -131,73 +136,221 @@ class expanding_window(object):
 #        index_output = [(train,test) for train,test in zip(self.output_train,self.output_vali)] #self.output_train and self.output_vali are lists of lists
 #        return index_output
         # list for MSE 
-    def pca_tune(self, n_cores, max_k): # Hyperparams : number of pc's
+    def pca_tune(self, max_k, pp): # Hyperparams : number of pc's
         if (max_k < 1) or (max_k > (self.n_col - 1)):
             return "max_k not appropriate"
             
-        def pca_f(train_dat, vali_dat, k):
-            pca = PCA()
-            train_dat_X = pca.fit_transform(train_dat.drop('y', axis = 1))[:,:k]
-            vali_dat_X = pca.fit_transform(vali_dat.drop('y', axis = 1))[:,:k]
+        def pca_f(train_dat, vali_dat, train_y_mean, k):
+            pca = PCA(n_components = k)
+            # pc direction 
+#            train_dat_X = pca.fit_transform(train_dat.drop('y', axis = 1))[:,:k]
+#            vali_dat_X = pca.fit_transform(vali_dat.drop('y', axis = 1))[:,:k]
+            pca.fit(train_dat.drop('y', axis = 1))
+            train_dat_X = pca.transform(train_dat.drop('y', axis = 1)) # i.e. train_dat_pc
+            vali_dat_X = pca.transform(vali_dat.drop('y', axis = 1))
           # Huber loss different from GKX and hyperparam not adjusted -- no use of Huber in GKX 
 #            huber = HuberRegressor().fit(train_dat_X, train_dat['y'])
             reg = LinearRegression().fit(train_dat_X, train_dat['y'])
-            # Mse on validation set 
-            mse = mean_squared_error(reg.predict(vali_dat_X), vali_dat['y'])
+            # Mse on validation set . AT: vali_dat and test_dat not demeaned
+            mse = mean_squared_error((reg.predict(vali_dat_X) + train_y_mean), vali_dat['y'])
+#            R_square = 1 - np.sum(((reg.predict(vali_dat_X) + train_y_mean) - vali_dat['y'])**2) / np.sum((vali_dat['y'] - train_y_mean) ** 2)
+
             return mse 
+#            return R_square
         
-        R_IS_l = []
-        R_OOS_l =[]
         
-        pp = Pool(n_cores)
         
         for train, vali, test in zip(self.output_train, self.output_vali, self.output_test):
             train_dat = self.data.loc[train,:]
             vali_dat = self.data.loc[vali,:]
             test_dat = self.data.loc[test,:]
             
-#            pdb.set_trace()
+            # Standardize train_X and center train_y and store the info
+            scaler_X = StandardScaler()
+            scaler_X.fit(train_dat.drop('y', axis = 1))
+            scaler_y = StandardScaler(with_std = False)
+            scaler_y.fit(np.array(train_dat[['y']]))
+             
+            # Transformed data using mean and std from training data
+            train_dat_t = pd.DataFrame(scaler_X.transform(train_dat.drop('y', axis = 1)),columns = train_dat.columns[:-1])
+            train_dat_t['y'] = scaler_y.transform(np.array(train_dat['y']).reshape(-1,1)) # Do not demean on vali_dat and test_dat
             
-            func = partial(pca_f, train_dat, vali_dat) # fix train_dat and vali_dat
+            vali_dat_t = pd.DataFrame(scaler_X.transform(vali_dat.drop('y', axis = 1)),columns = vali_dat.columns[:-1])
+            vali_dat_t['y'] = np.array(vali_dat['y'])
+
+ 
+            test_dat_t = pd.DataFrame(scaler_X.transform(test_dat.drop('y', axis = 1)),columns = test_dat.columns[:-1])
+            test_dat_t['y'] = np.array(test_dat['y'])
+            
+            train_y_mean = scaler_y.mean_
+            
+            func = partial(pca_f, train_dat_t, vali_dat_t, train_y_mean) # fix train_dat and vali_dat
             mse_l = pp.map(func, range(1,max_k+1,1))
             k_s = mse_l.index(min(mse_l)) + 1 # of PCs selected
+#            k_s = mse_l.index(max(mse_l)) + 1 # of PCs selected
+
             print(k_s)
 #            pdb.set_trace()
             
-            pca = PCA()
-            test_dat_X = pca.fit_transform(test_dat.drop('y', axis = 1))[:,:k_s]
-            train_dat_X = pca.fit_transform(train_dat.drop('y', axis = 1))[:,:k_s]
-            # refit the train -- time inefficient
-#            huber = HuberRegressor().fit(train_dat_X, train_dat['y']) 
-            reg = LinearRegression().fit(train_dat_X, train_dat['y'])
+            pca = PCA(n_components = k_s)
+            # pc direction 
+            pca.fit(train_dat_t.drop('y', axis = 1))
+           # refit the train -- time inefficient
+            train_dat_pc = pca.transform(train_dat_t.drop('y', axis = 1))
+            test_dat_pc = pca.transform(test_dat_t.drop('y', axis = 1))
+          # Huber loss different from GKX and hyperparam not adjusted -- no use of Huber in GKX 
+#            huber = HuberRegressor().fit(train_dat_X, train_dat['y'])
+            reg = LinearRegression().fit(train_dat_pc, train_dat_t['y'])
 #            R_OOS = huber.score(test_dat_X, test_dat['y']) # Notice that the denominator mean is not 0 , not as GKX
 #             R_IS = huber.score(train_dat_X, train_dat['y'])
-            # GKX R^2 
-            R_OOS = 1 - np.sum((reg.predict(test_dat_X) - test_dat['y'])**2) / np.sum((test_dat['y']) ** 2)
-            R_IS = 1 - np.sum((reg.predict(train_dat_X) - train_dat['y'])**2) / np.sum((train_dat['y']) ** 2)
-
-            R_IS_l.append(R_IS)
-            R_OOS_l.append(R_OOS)
-        pp.close()
-        pp.join()
-        pp.clear()
+#            # GKX R^2 
+            R_OOS = 1 - np.sum(((reg.predict(test_dat_pc) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y']) ** 2)
+            R_IS = 1 - np.sum(((reg.predict(train_dat_pc) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y']) ** 2)
+#            simu R^2
+#            R_OOS = 1 - np.sum(((reg.predict(test_dat_pc) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y'] - train_y_mean) ** 2)
+#            R_IS = 1 - np.sum(((reg.predict(train_dat_pc) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y'] - train_y_mean) ** 2)
         
-        return(pd.DataFrame({'R_IS_l':R_IS_l, 'R_OOS_l':R_OOS_l}))
-    def pls_tune(self, n_cores, max_k):
+        return([R_IS, R_OOS])
+    def pls_tune(self, max_k, pp): # Hyperparams : number of pc's
         if (max_k < 1) or (max_k > (self.n_col - 1)):
             return "max_k not appropriate"
-        
-        def pls_f(train_dat, vali_dat, k):
+            
+        def pls_f(train_dat, vali_dat, train_y_mean, k):
             pls = PLSRegression(n_components = k)
+            # pc direction 
+#            train_dat_X = pca.fit_transform(train_dat.drop('y', axis = 1))[:,:k]
+#            vali_dat_X = pca.fit_transform(vali_dat.drop('y', axis = 1))[:,:k]
             pls.fit(train_dat.drop('y', axis = 1), train_dat['y'])
-            # mse on validation set 
-            mse = mean_squared_error(pls.predict(vali_dat.drop('y', axis = 1)), vali_dat['y'])
-            return mse
+            # Mse on validation set . AT: vali_dat and test_dat not demeaned
+            mse = mean_squared_error((pls.predict(vali_dat.drop('y', axis = 1)) + train_y_mean), vali_dat['y'])
+#            R_square = 1 - np.sum(((reg.predict(vali_dat_X) + train_y_mean) - vali_dat['y'])**2) / np.sum((vali_dat['y'] - train_y_mean) ** 2)
+
+            return mse 
+#            return R_square
         
-        R_IS_l = []
-        R_OOS_l =[]
         
-        pp = Pool(n_cores)
+        
+        for train, vali, test in zip(self.output_train, self.output_vali, self.output_test):
+            train_dat = self.data.loc[train,:]
+            vali_dat = self.data.loc[vali,:]
+            test_dat = self.data.loc[test,:]
+            
+            # Standardize train_X and center train_y and store the info
+            scaler_X = StandardScaler()
+            scaler_X.fit(train_dat.drop('y', axis = 1))
+            scaler_y = StandardScaler(with_std = False)
+            scaler_y.fit(np.array(train_dat[['y']]))
+             
+            # Transformed data using mean and std from training data
+            train_dat_t = pd.DataFrame(scaler_X.transform(train_dat.drop('y', axis = 1)),columns = train_dat.columns[:-1])
+            train_dat_t['y'] = scaler_y.transform(np.array(train_dat['y']).reshape(-1,1)) # Do not demean on vali_dat and test_dat
+            
+            vali_dat_t = pd.DataFrame(scaler_X.transform(vali_dat.drop('y', axis = 1)),columns = vali_dat.columns[:-1])
+            vali_dat_t['y'] = np.array(vali_dat['y'])
+
+ 
+            test_dat_t = pd.DataFrame(scaler_X.transform(test_dat.drop('y', axis = 1)),columns = test_dat.columns[:-1])
+            test_dat_t['y'] = np.array(test_dat['y'])
+            
+            train_y_mean = scaler_y.mean_
+#            pdb.set_trace()
+            
+            func = partial(pls_f, train_dat_t, vali_dat_t, train_y_mean) # fix train_dat and vali_dat
+            mse_l = pp.map(func, range(1,max_k+1,1))
+            k_s = mse_l.index(min(mse_l)) + 1 # of PCs selected
+#            k_s = mse_l.index(max(mse_l)) + 1 # of PCs selected
+
+            print(k_s)
+#            pdb.set_trace()
+            
+            
+            pls = PLSRegression(n_components = k_s)
+            # pc direction 
+            pls.fit(train_dat_t.drop('y', axis = 1), train_dat_t['y'])
+#            # GKX R^2 
+            R_OOS = 1 - np.sum(((pls.predict(test_dat_t.drop('y', axis =1)) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y']) ** 2)
+            R_IS = 1 - np.sum(((pls.predict(train_dat_t.drop('y', axis =1)) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y']) ** 2)
+#            simu R^2
+#            R_OOS = 1 - np.sum(((reg.predict(test_dat_pc) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y'] - train_y_mean) ** 2)
+#            R_IS = 1 - np.sum(((reg.predict(train_dat_pc) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y'] - train_y_mean) ** 2)
+        
+        return([R_IS, R_OOS])
+    def Enet_tune(self, lambda_v_l, pp): # rho is taken as 0.5
+            
+        def Enet_f(train_dat, vali_dat, train_y_mean, lambda_v):
+            ereg = ElasticNet(alpha = lambda_v)
+            ereg.fit(train_dat.drop('y', axis = 1), train_dat['y'])
+            # Mse on validation set . AT: vali_dat and test_dat not demeaned
+            mse = mean_squared_error((ereg.predict(vali_dat.drop('y', axis = 1)) + train_y_mean), vali_dat['y'])
+#            R_square = 1 - np.sum(((ereg.predict(vali_dat_X) + train_y_mean) - vali_dat['y'])**2) / np.sum((vali_dat['y'] - train_y_mean) ** 2)
+
+            return mse 
+#            return R_square
+        
+        
+        
+        for train, vali, test in zip(self.output_train, self.output_vali, self.output_test):
+            train_dat = self.data.loc[train,:]
+            vali_dat = self.data.loc[vali,:]
+            test_dat = self.data.loc[test,:]
+            
+            # Standardize train_X and center train_y and store the info
+            scaler_X = StandardScaler()
+            scaler_X.fit(train_dat.drop('y', axis = 1))
+            scaler_y = StandardScaler(with_std = False)
+            scaler_y.fit(np.array(train_dat[['y']]))
+             
+            # Transformed data using mean and std from training data
+            train_dat_t = pd.DataFrame(scaler_X.transform(train_dat.drop('y', axis = 1)),columns = train_dat.columns[:-1])
+            train_dat_t['y'] = scaler_y.transform(np.array(train_dat['y']).reshape(-1,1)) # Do not demean on vali_dat and test_dat
+            
+            vali_dat_t = pd.DataFrame(scaler_X.transform(vali_dat.drop('y', axis = 1)),columns = vali_dat.columns[:-1])
+            vali_dat_t['y'] = np.array(vali_dat['y'])
+
+ 
+            test_dat_t = pd.DataFrame(scaler_X.transform(test_dat.drop('y', axis = 1)),columns = test_dat.columns[:-1])
+            test_dat_t['y'] = np.array(test_dat['y'])
+            
+            train_y_mean = scaler_y.mean_
+#            pdb.set_trace()
+            
+            func = partial(Enet_f, train_dat_t, vali_dat_t, train_y_mean) # fix train_dat and vali_dat
+            mse_l = pp.map(func, lambda_v_l)
+            lambda_v = lambda_v_l[mse_l.index(min(mse_l))] # lambda_v selected
+
+            print(lambda_v)
+#            pdb.set_trace()
+            
+            
+            ereg = ElasticNet(alpha = lambda_v)
+            ereg.fit(train_dat_t.drop('y', axis = 1), train_dat_t['y'])
+#            # GKX R^2 
+            R_OOS = 1 - np.sum(((ereg.predict(test_dat_t.drop('y', axis =1)) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y']) ** 2)
+            R_IS = 1 - np.sum(((ereg.predict(train_dat_t.drop('y', axis =1)) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y']) ** 2)
+#            simu R^2
+#            R_OOS = 1 - np.sum(((ereg.predict(test_dat_pc) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y'] - train_y_mean) ** 2)
+#            R_IS = 1 - np.sum(((ereg.predict(train_dat_pc) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y'] - train_y_mean) ** 2)
+
+        return([R_IS, R_OOS])
+
+#    def Enet_tune_H(self, n_cores, rho_l, lambda_l):        
+
+
+
+    def RF_tune(self, max_depth_l, n_tree, pp):
+            
+        def RF_f(train_dat, vali_dat, n_tree, max_depth): # notice arguments order 
+            rfreg = RandomForestRegressor(max_depth = max_depth, n_estimators = n_tree)
+            rfreg.fit(train_dat.drop('y', axis = 1), train_dat['y'])
+            # Mse on validation set . AT: vali_dat and test_dat not demeaned
+            mse = mean_squared_error((rfreg.predict(vali_dat.drop('y', axis = 1))), vali_dat['y'])
+#            R_square = 1 - np.sum(((ereg.predict(vali_dat_X) + train_y_mean) - vali_dat['y'])**2) / np.sum((vali_dat['y'] - train_y_mean) ** 2)
+
+            return mse 
+#            return R_square
+        
+        
+#        pp = Pool(n_cores)
         
         for train, vali, test in zip(self.output_train, self.output_vali, self.output_test):
             train_dat = self.data.loc[train,:]
@@ -206,30 +359,84 @@ class expanding_window(object):
             
 #            pdb.set_trace()
             
-            func = partial(pls_f, train_dat, vali_dat) # fix train_dat and vali_dat
-            mse_l = pp.map(func, range(1,max_k+1,1))
-            k_s = mse_l.index(min(mse_l)) + 1 # of PCs selected
-            
+            func = partial(RF_f, train_dat, vali_dat, n_tree) # fix train_dat and vali_dat
+            mse_l = pp.map(func, max_depth_l)
+            max_depth_s = max_depth_l[mse_l.index(min(mse_l))] # max_depth selected
+
+            print(max_depth_s)
 #            pdb.set_trace()
-            pls = PLSRegression(n_components = k_s)
-            pls.fit(train_dat.drop('y', axis = 1), train_dat['y'])
             
-            # GKX R^2 
-            R_OOS = 1 - np.sum((pls.predict(test_dat.drop('y', axis = 1)) - test_dat['y'])**2) / np.sum((test_dat['y']) ** 2)
-            R_IS = 1 - np.sum((pls.predict(train_dat_X) - train_dat['y'])**2) / np.sum((train_dat['y']) ** 2)
+            
+            rfreg = RandomForestRegressor(max_depth = max_depth_s, n_estimators = n_tree)
 
-            R_IS_l.append(R_IS)
-            R_OOS_l.append(R_OOS)
-        pp.close()
-        pp.join()
-        pp.clear()
-#    def Enet_tune(self, n_cores, rho_l, lambda_l):
+            rfreg.fit(train_dat.drop('y', axis = 1), train_dat['y'])
+#            # GKX R^2 
+            R_OOS = 1 - np.sum(((rfreg.predict(test_dat.drop('y', axis =1))) - test_dat['y'])**2) / np.sum((test_dat['y']) ** 2)
+            R_IS = 1 - np.sum(((rfreg.predict(train_dat.drop('y', axis =1))) - train_dat['y'])**2) / np.sum((train_dat['y']) ** 2)
+#            simu R^2
+#            R_OOS = 1 - np.sum(((ereg.predict(test_dat_pc) + train_y_mean) - test_dat_t['y'])**2) / np.sum((test_dat_t['y'] - train_y_mean) ** 2)
+#            R_IS = 1 - np.sum(((ereg.predict(train_dat_pc) + train_y_mean) - train_dat_t['y'])**2) / np.sum((train_dat_t['y'] - train_y_mean) ** 2)
 
+        return([R_IS, R_OOS])
         
         
 
         
-#%%
+#%% Main.py 
+
+#from rolling_scheme_plus_Validation import expanding_window
+#import time 
+##from pathos.pools import ProcessPool as Pool 
+#from pathos.pools import ThreadPool as Pool   # Faster for small data, but could be slower for large data ? 
+##from pathos.pools import ParallelPool as Pool # Fastest for small data -> can be slow on huge data 
+#
+## Nested parallel: Not enough space if the data is too big 
+#start = time.time()
+#result_pca = []
+#result_pls = []
+#result_Enet = []
+#result_RF = []
+#
+#
+#pp = Pool(4) #n_cores
+#for _ in range(4): # of repeated iterations 
+#    
+#
+#    dat_simu = dat_gen(N = 200, m = 100, T = 180, stdv = 0.05, theta_w = 0.02, stde = 0.05)
+#    dat_m1 = dat_simu[0]
+#
+#    # Rolling procedure: T = 180 (if taken as monthly data), N = 200 
+#    tscv = expanding_window(initial = 5*12*200 , horizon = 5*12*200, period = 1, test_p = 5*12*200)
+#    #tscv.split(pd.concat([train_m1, vali_m1]))
+#    tscv.split(dat_m1)
+#
+#
+###    PCA
+##    result_pca.append(tscv.pca_tune(30,pp)) # max PCs
+##    result_pca_df = pd.DataFrame(result_pca, columns = ['R_IS', 'R_OOS'])
+##    
+##    
+###    PLS  
+##    result_pls.append(tscv.pls_tune(30,pp)) # n_cores and max PCs 
+##    result_pls_df = pd.DataFrame(result_pls, columns = ['R_IS', 'R_OOS'])
+##
+##
+###    Enet without Huber Loss 
+##    result_Enet.append(tscv.Enet_tune([1e-4, 1e-3, 1e-2, 1e-1], pp))
+##    result_Enet_df = pd.DataFrame(result_Enet, columns = ['R_IS', 'R_OOS'])
+#
+##   Random Forest  n_tree = 300
+#    result_RF.append(tscv.RF_tune(list(range(1,7,1)), 300, pp))
+#    result_RF_df = pd.DataFrame(result_RF, columns = ['R_IS', 'R_OOS'])
+#    
+#    
+#pp.close()
+#pp.join()
+#pp.clear()
+#end = time.time()
+#print(end - start)
+
+        
 #%%
         
 #if __name__ == '__main__': 
@@ -255,16 +462,3 @@ class expanding_window(object):
 #    print(test_index)
 #
 
-#%%
-#X = np.random.randint(0,1000,size = (120,2))
-#y = np.random.randint(0,1000,size = (120,1))
-#
-#tscv = expanding_window(initial = 36, horizon = 24,period = 1)
-#for train_index, test_index in tscv.split(X):
-#    print(train_index)
-#    print(test_index)
-
-
-
-#%%
-# view rawexpanding_window.py hosted with ❤ by GitHub
