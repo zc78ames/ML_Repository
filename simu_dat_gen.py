@@ -81,10 +81,10 @@ def dat_gen(N, m, T, stdv, theta_w, stde):
 #    rt_m2 = np.dot(z,theta)
     
     # Combine covariate and response 
-    col_names = ['x' + str(x) for x in range(1,m+1)] + ['y']
-    dat_m1 = pd.DataFrame(np.hstack((c,r1.reshape(-1,1))), columns = col_names)
+    col_names = ['x' + str(x) for x in range(1,m+1)] + ['cx' + str(x) for x in range(1,m+1)] + ['y']
+    dat_m1 = pd.DataFrame(np.hstack((c,cy,r1.reshape(-1,1))), columns = col_names)
     
-    dat_m2 = pd.DataFrame(np.hstack((c,r1_m2.reshape(-1,1))), columns = col_names)
+    dat_m2 = pd.DataFrame(np.hstack((c,cy,r1_m2.reshape(-1,1))), columns = col_names)
     # Equal Split to 3 pieces 
     #train_m1, vali_m1, test_m1 = np.split(dat_m1, 3)
     return([dat_m1, dat_m2])
